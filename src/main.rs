@@ -1,82 +1,39 @@
 extern crate docopt;
 #[macro_use] extern crate lazy_static;
-#[macro_use] extern crate log;
 extern crate regex;
 extern crate rustc_serialize;
 extern crate tempdir;
 
 use std::env;
-use std::error::{self, Error};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
-use std::fmt;
+use std::error::{Error};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::ffi::{OsString};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::process::{self, Command};
-use std::str::{FromStr};
-use std::sync::{Arc, Mutex};
+use std::path::{self, Path, PathBuf};
+use std::process::{self};
 
 use docopt::{Docopt};
-
-use log::{LogLevel, LogLevelFilter, LogMetadata, LogRecord};
 
 use regex::{Regex};
 
 use tempdir::TempDir;
 
-const USAGE: &'static str = r#"
-Trainz Asset Builder.
-
-Builds all assets within given path:
-1. Copies asset to temporary directory.
-2. Replaces asset KUID with a dummy one.
-3. Installs asset to Trainz.
-4. Commits and validates it.
-5. Removes it from Trainz.
-
-Assets are determined by recursively searching in directories for `config.txt` file which contains
-string like:
-kuid <(kuid|kuid2):[0-9]+:[0-9]+:[0-9]+>
-
-Directory containing such file is treated as asset root and has steps 1-4 performed on it.
-
-Usage:
-  tzbuildasset build <path> [--trainzutil=PATH] [(-v | --verbose)]
-  tzbuildasset (-h | --help)
-  tzbuildasset --version
-
-Options:
-  -v --verbose         Detailed output
-  --trainzutil=PATH    Path to TrainzUtil executable [default: TrainzUtil]
-  -h --help            Show this help text
-  --version            Show version
-"#;
-
-#[derive(Debug, RustcDecodable)]
-struct Args {
-    flag_trainzutil: String,
-    flag_verbose: bool,
-    flag_version: bool,
-    arg_path: String,
-    cmd_build: bool,
-}
+use displayprefix::{with_prefix};
 
 
-fn main() {
-    let args: Args = Docopt::new(USAGE)
-                            .and_then(|d| d.decode())
-                            .unwrap_or_else(|e| e.exit());
-    if args.flag_version {
-        println!("{}", env!("CARGO_PKG_VERSION"));
-    }
-    else if args.cmd_build {
-        build(args);
-    }
-}
+mod displayprefix;
+#[macro_use] mod log;
+mod trainzutil;
 
 
 lazy_static! {
     static ref KUID_MATCHER: Regex = {
         let r = Regex::new(r#"(?ixm)^kuid \s+ <(?P<kuid> kuid2? : \d+ : \d+ ( : \d+ )? )>"#);
+        r.unwrap()
+    };
+
+    static ref USERNAME_MATCHER: Regex = {
+        let r = Regex::new(r#"(?ixm)^username \s+ " (?P<name> [^"]* ) "#);
         r.unwrap()
     };
 }
@@ -85,73 +42,181 @@ const KUID_DUMMY: &'static str = "kuid:298469:999999";
 const KUID_DUMMY_TAG: &'static str = "kuid  <kuid:298469:999999>";
 
 
-fn build(args: Args) {
-    let stats = OutputLogger::init(args.flag_verbose);
+const USAGE: &'static str = r#"
+Trainz Asset Builder.
 
-    let build_path = Path::new(&args.arg_path);
-    let trainzutil_path = Path::new(&args.flag_trainzutil);
+Usage:
+  tzbuildasset build   [options] [INPUT]
+  tzbuildasset install [options] [INPUT]
 
-    trace!("Build path: {}", build_path.display());
-    trace!("TrainzUtil path: {}", trainzutil_path.display());
+Options:
+  -r --recursive       Search for assets in all subfolders recursively
+  -c --config          Show path to config.txt in output
+  -k --kuid            Show KUID in output
+  --trainzutil PATH    Path to TrainzUtil executable
+  -v --verbose         Detailed output
+  -s --silent          Silent output
+  --temp-dir PATH      Use specified temporary directory
+  -h --help            Show help
+  --version            Show version
 
-    match execute_trainzutil(trainzutil_path, &["version"]) {
-        Ok(output) => trace!("TrainzUtil version: {}", output.lines[0]),
+Builds all assets within given path with TrainzUtil.
+Commands:
+  build                Builds by installing temporary asset with dummy KUID.
+  install              Installs asset directly.
+
+Assets are determined by searching for `config.txt` file which contains string like:
+kuid <(kuid|kuid2):[0-9]+:[0-9]+:[0-9]+>
+"#;
+
+#[derive(Debug, RustcDecodable)]
+#[allow(non_snake_case)]
+struct Args {
+    flag_recursive: bool,
+    flag_config: bool,
+    flag_kuid: bool,
+    flag_trainzutil: Option<String>,
+    flag_verbose: bool,
+    flag_silent: bool,
+    flag_temp_dir: Option<String>,
+    arg_INPUT: Option<String>,
+    cmd_build: bool,
+    cmd_install: bool,
+
+    flag_help: bool,
+    flag_version: bool,
+}
+
+
+fn main() {
+    let args: Args = Docopt::new(USAGE)
+                            .and_then(|d| d.decode())
+                            .unwrap_or_else(|e| e.exit());
+    let log_mode = match (args.flag_silent, args.flag_verbose) {
+        (true, _) => log::Mode::Silent,
+        (_, true) => log::Mode::Verbose,
+        (_, _) => log::Mode::Normal,
+    };
+    log::init(log_mode);
+
+    if args.flag_version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    else if args.cmd_build || args.cmd_install {
+        let success = build(&BuildArguments {
+            build_path: &env::current_dir().unwrap().join(args.arg_INPUT.unwrap_or(String::new())),
+            trainzutil_path: Path::new(&args.flag_trainzutil.map(|s| OsString::from(s))
+                    .or_else(|| env::var_os("TRAINZUTIL_PATH"))
+                    .unwrap_or_else(|| OsString::from("TrainzUtil"))),
+            temp_path: args.flag_temp_dir.as_ref().map(|s| Path::new(s)),
+            show_config_path: args.flag_config,
+            show_kuid: args.flag_kuid,
+            install: args.cmd_install,
+            recursive: args.flag_recursive
+        });
+
+        process::exit(if success { 0 } else { 1 });
+    }
+}
+
+
+struct BuildArguments<'a> {
+    pub build_path: &'a Path,
+    pub trainzutil_path: &'a Path,
+    pub temp_path: Option<&'a Path>,
+    pub show_config_path: bool,
+    pub show_kuid: bool,
+    pub install: bool,
+    pub recursive: bool
+}
+
+
+fn build(args: &BuildArguments) -> bool {
+
+    log_verbose!(Info, "Build path: {}", args.build_path.display());
+    log_verbose!(Info, "TrainzUtil path: {}", args.trainzutil_path.display());
+
+    match trainzutil::execute(args.trainzutil_path, &["version"]) {
+        Ok(output) => log_verbose!(Info, "TrainzUtil version: {}", output.lines[0]),
         Err(e) => {
-            error!("TrainzUtil error: {}", e);
-            process::exit(2);
+            log_normal!(Error, "Unable to execute TrainzUtil: {}", e);
+            log_silent!(Error, "- <NULL> : TrainzUtil not found");
+            return false;
         }
     }
 
-    for asset in locate_assets(build_path) {
-        build_asset(asset, build_path, trainzutil_path);
+    let mut asset_count = 0i32;
+    let mut failed_count = 0i32;
+
+    for asset in &locate_assets(args.build_path, args.recursive) {
+        asset_count += 1;
+        if !build_asset(asset, args) {
+            failed_count += 1;
+        }
     }
 
-    let stats = stats.lock().unwrap();
-    process::exit(if stats.error_count > 0 { 1 } else { 0 });
+    log_normal!(Info, "==============================================");
+    log_normal!(Info, "BUILD {} ({} Total, {} Succeeded, {} Failed)",
+            if failed_count == 0 { "SUCCESS" } else { "FAILED " },
+            asset_count,
+            asset_count - failed_count,
+            failed_count);
+    log_normal!(Info, "==============================================");
+    log_silent!(Info, "OK ({} Errors, {} Warnings)", failed_count, 0);
+
+    failed_count == 0
 }
 
 
 #[derive(Debug)]
 struct Asset {
+    pub name: String,
     pub kuid: String,
     pub path: PathBuf
 }
 
-fn locate_assets(build_path: &Path) -> Vec<Asset> {
+fn locate_assets(build_path: &Path, recursive: bool) -> Vec<Asset> {
     let mut located_assets = Vec::new();
-    locate_assets_recursive(build_path, &mut located_assets);
+    locate_assets_recursive(build_path, recursive, &mut located_assets);
     located_assets
 }
 
 const KNOWN_DIRS: &'static [&'static str] = &[".git", ".hg"];
 
-fn locate_assets_recursive(path: &Path, located_assets: &mut Vec<Asset>) {
+fn locate_assets_recursive(path: &Path, recursive: bool, located_assets: &mut Vec<Asset>) {
 
-    trace!("Entering directory: {0}", path.display());
+    log_verbose!(Info, "Entering directory: {0}", path.display());
 
     // First try to read config.txt file
     let config_path = path.join("config.txt");
     if let Ok(config_file) = File::open(&config_path) {
         // config.txt exists: read contents and try to find kuid
-        trace!("Found config.txt: {}", config_path.display());
+        log_verbose!(Info, "Found config.txt");
         let mut contents = String::new();
-        BufReader::new(config_file).read_to_string(&mut contents).unwrap();
+        BufReader::new(config_file).read_to_string(&mut contents).ok()
+                .expect("unable to read config.txt");
 
         if let Some(caps) = KUID_MATCHER.captures(&contents) {
             // Found kuid - adding this path as asset root and exiting
             let kuid = caps.name("kuid").unwrap();
-            trace!("Found kuid: {}", kuid);
-            info!("Found asset: <{kuid}>, {path}", kuid = kuid, path = path.display());
+
+            let name = USERNAME_MATCHER.captures(&contents)
+                    .and_then(|cap| cap.name("name"))
+                    .unwrap_or("");
+
+            log_normal!(Info, "Found asset '{}' <{}>: {}", name, kuid, path.display());
 
             located_assets.push(Asset {
+                name: if name.is_empty() { format!("<{}>", kuid) } else { name.to_owned() },
                 kuid: kuid.to_owned(),
-                path: path.to_owned()
+                path: path.to_owned(),
             });
             return;
         }
     }
     // otherwise recursively walk all directories
-    else {
+    else if (recursive) {
         for entry in fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
             if entry.metadata().unwrap().is_dir() {
@@ -159,72 +224,132 @@ fn locate_assets_recursive(path: &Path, located_assets: &mut Vec<Asset>) {
                 if entry.file_name().to_str().map(|s| KNOWN_DIRS.contains(&s)).unwrap_or(false) {
                     continue;
                 }
-                locate_assets_recursive(&entry.path(), located_assets);
+                locate_assets_recursive(&entry.path(), true, located_assets);
             }
         }
     }
 }
 
 
-fn build_asset(asset: Asset, build_path: &Path, trainzutil_path: &Path) {
-    info!("Building asset <{}>", &asset.kuid);
+#[allow(unused_assignments)]
+fn build_asset(asset: &Asset, args: &BuildArguments) -> bool {
 
-    trace!("Creating temporary directory...");
-    let temp_dir = TempDir::new("tzassetbuild").unwrap();
-    trace!("Path: {}", temp_dir.path().display());
-    copy_dir(&asset.path, temp_dir.path()).unwrap();
+    let asset_path: &Path = &asset.path;
+    let asset_kuid: &str = &asset.kuid;
+    let asset_name: &str  = &asset.name;
 
-    trace!("Replacing kuid...");
-    replace_kuid(temp_dir.path());
+    let asset_relative_path = &{
+        let comps = asset_path.components().skip(args.build_path.components().count());
+        let mut buf = PathBuf::new();
+        for c in comps {
+            match c {
+                path::Component::Normal(p) => buf.push(p),
+                _ => panic!("unexpected path component")
+            }
+        }
+        buf
+    };
+    let asset_output_name = match (args.show_config_path, args.show_kuid) {
+        (true, _) => format!("[{}]", asset_relative_path.join("config.txt").to_string_lossy().as_ref()),
+        (_, true) => format!("<{}>", asset_kuid),
+        (_, _)    => format!("[{}]", asset_relative_path.to_string_lossy().as_ref()),
+    };
 
-    trace!("Installing...");
-    let output = match execute_trainzutil(trainzutil_path,
-            &["installfrompath", temp_dir.path().to_str().unwrap()]) {
-        Ok(output) => output,
-        Err(e) => {
-            error!("Failed to install asset <{}>: {}", &asset.kuid, e);
-            return;
+    log_normal!(Info, "Building asset '{}'", asset_name);
+
+    // Holds temp dir until work is done
+    // Directory is deleted in object's destructor
+    let mut temp_dir = None;
+
+    let install_path = if args.install {
+        &*asset.path
+    } else {
+        if let Some(p) = args.temp_path {
+            let temp_path = Path::new(p);
+            let _ = fs::remove_dir_all(temp_path);
+            fs::create_dir_all(temp_path).ok().expect("unable to access temporary directory");
+            log_verbose!(Info, "Using temporary directory: {}", temp_path.display());
+            temp_path
+        } else {
+            temp_dir = Some(TempDir::new("tzassetbuild").ok()
+                    .expect("unable to create temporary directory"));
+            let temp_path = temp_dir.as_ref().unwrap().path();
+            log_verbose!(Info, "Temporary directory: {}", temp_path.display());
+            temp_path
         }
     };
-    trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
 
-    trace!("Committing...");
-    let output = match execute_trainzutil(trainzutil_path, &["commit", KUID_DUMMY]) {
-        Ok(output) => output,
-        Err(e) => {
-            error!("Failed to commit asset <{}>: {}", &asset.kuid, e);
-            return;
+    let install_kuid = if args.install { asset_kuid } else { KUID_DUMMY };
+
+    if !args.install {
+        log_verbose!(Info, "Copying asset files to temp directory...");
+        copy_dir(asset_path, install_path).unwrap();
+
+        log_verbose!(Info, "Replacing kuid...");
+        replace_kuid(install_path).unwrap();
+    }
+
+    let result = ({
+        match trainzutil::execute(args.trainzutil_path,
+                &["installfrompath", install_path.to_string_lossy().as_ref()]) {
+            Ok(output) => {
+                log_verbose!(Info, "Install susccess:\n{}", with_prefix(">", &output)); Ok(())
+            },
+            Err(e) => {
+                log_normal!(Error, "Install failed: {}", e); Err(())
+            }
         }
-    };
-    trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
-
-    trace!("Validating...");
-    let output = match execute_trainzutil(trainzutil_path, &["validate", KUID_DUMMY]) {
-        Ok(output) => output,
-        Err(e) => {
-            error!("Failed to validate asset <{}>: {}", &asset.kuid, e);
-            return;
+    }).and_then(|_| {
+        match trainzutil::execute(args.trainzutil_path, &["commit", install_kuid]) {
+            Ok(output) => {
+                log_verbose!(Info, "Commit success:\n{}", with_prefix(">", &output)); Ok(())
+            },
+            Err(e) => {
+                log_normal!(Error, "Commit failed: {}", e); Err(())
+            }
         }
-    };
-    trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
-
-    // TODO: handle errors in output
-
-    trace!("Deleting...");
-    let output = match execute_trainzutil(trainzutil_path, &["delete", KUID_DUMMY]) {
-        Ok(output) => output,
-        Err(e) => {
-            error!("Failed to delete asset <{}>: {}", &asset.kuid, e);
-            return;
+    }).and_then(|_| {
+        match trainzutil::execute(args.trainzutil_path, &["validate", install_kuid]) {
+            Ok(output) => {
+                log_verbose!(Info, "Validation success:\n{}", with_prefix(">", &output));
+                log_validation_output(&asset_output_name, &output);
+                if output.errors == 0 {
+                    Ok(())
+                } else {
+                    log_verbose!(Error, "Asset is not valid"); Err(())
+                }
+            }
+            Err(e) => {
+                log_normal!(Error, "Validation failed: {}", e); Err(())
+            }
         }
-    };
-    trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
+    }).and_then(|_| {
+        log_normal!(Info, "Build success");
+        Ok(())
+    }).or_else(|_| {
+        log_normal!(Error, "Build failed");
+        Err(())
+    });
+
+    // if !args.install {
+    //     match trainzutil::execute(args.trainzutil_path, &["delete", KUID_DUMMY]) {
+    //         Ok(output) => {
+    //             log_verbose!(Info, "Delete success:\n{}", with_prefix(">", &output));
+    //         },
+    //         Err(e) => {
+    //             log_normal!(Warn, "Delete failed: {}", e);
+    //         }
+    //     }
+    // }
+
+    result.is_ok()
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
-    trace!("Copying directory {} to {}", src.display(), dst.display());
+    log_verbose!(Info, "Copying directory '{}' to '{}'", src.display(), dst.display());
     for entry in try!(fs::read_dir(src)) {
         let entry = try!(entry);
+        let entry_file_name = &PathBuf::from(entry.file_name());
         let entry_src_path = &entry.path();
         let entry_dst_path = &{
             let mut buf = PathBuf::from(dst);
@@ -233,7 +358,7 @@ fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
         };
 
         if try!(entry.file_type()).is_file() {
-            trace!("Copying file {} to {}", entry_src_path.display(), entry_dst_path.display());
+            log_verbose!(Info, "Copying file '{}' to '{}'", entry_file_name.display(), entry_dst_path.display());
             try!(fs::copy(entry_src_path, entry_dst_path));
         } else if try!(entry.file_type()).is_dir() {
             try!(fs::create_dir(entry_dst_path));
@@ -261,187 +386,25 @@ fn replace_kuid(asset_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-
-//
-// TrainzUtil handling
-
-
-type TrainUtilResult = Result<TrainzUtilOutput, TrainzUtilError>;
-
-#[derive(Clone, Debug)]
-struct TrainzUtilOutput {
-    pub lines: Vec<String>,
-    pub errors: u32,
-    pub warnings: u32
-}
-
-impl TrainzUtilOutput {
-    fn from_stdout(stdout: Vec<u8>) -> Self {
-        let mut lines: Vec<String> = Cursor::new(stdout).lines().map(|l| l.unwrap()).collect();
-        for line in &mut lines {
-            if line.ends_with('\r') {
-                line.pop().unwrap();
+fn log_validation_output(asset: &str, output: &trainzutil::Output) {
+    for line in &output.lines {
+        if let Some(caps) = trainzutil::TZUTIL_OUTPUT_MATCHER.captures(line) {
+            let prefix = caps.name("prefix").unwrap();
+            let message = caps.name("message").unwrap();
+            match prefix {
+                "-" => log_normal! (Error, "{}", message),
+                "!" => log_normal! ( Warn, "{}", message),
+                "+" => log_normal! ( Info, "{}", message),
+                ";" => log_verbose!( Info, "{}", message),
+                 _   => unreachable!()
             }
-        }
-
-        let last_line = lines.pop().unwrap();
-        let results = Regex::new(r#"(?ix)
-            OK \s+
-            \( \s* (?P<errors>   \d+) \s+ Errors   \s* ,
-               \s* (?P<warnings> \d+) \s+ Warnings \s* \)
-        "#).unwrap().captures(&last_line).unwrap();
-
-        TrainzUtilOutput {
-            lines: lines,
-            errors: results.name("errors").and_then(|s| FromStr::from_str(s).ok()).unwrap(),
-            warnings: results.name("warnings").and_then(|s| FromStr::from_str(s).ok()).unwrap(),
-        }
-    }
-}
-
-impl fmt::Display for TrainzUtilOutput {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for line in &self.lines {
-            try!(write!(f, "{}\n", line));
-        }
-        try!(write!(f, "OK ({} Errors, {} Warnings)", self.errors, self.warnings));
-        Ok(())
-    }
-}
-
-struct DisplayPrefix<'a, T: fmt::Display> {
-    prefix: &'a str,
-    data: T
-}
-
-impl<'a, T: fmt::Display> fmt::Display for DisplayPrefix<'a, T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let text = format!("{}", self.data);
-        let mut first_line = true;
-        for line in text.lines() {
-            if !first_line {
-                try!(f.write_str("\n"));
+            match prefix {
+                "-" => log_silent!(Error, "{} {} : {}", prefix, asset, message),
+                "!" => log_silent!( Warn, "{} {} : {}", prefix, asset, message),
+                "+" => log_silent!( Info, "{} {} : {}", prefix, asset, message),
+                ";" => log_silent!( Info, "{} {} : {}", prefix, asset, message),
+                 _   => unreachable!()
             }
-            first_line = false;
-            try!(write!(f, "{}{}", self.prefix, line));
-        }
-        Ok(())
-    }
-}
-
-fn with_prefix<'a, T>(prefix: &'a str, data: T) -> DisplayPrefix<'a, T>
-        where T: fmt::Display {
-    DisplayPrefix {
-        prefix: prefix,
-        data: data
-    }
-}
-
-#[derive(Debug)]
-enum TrainzUtilError {
-    Failure(TrainzUtilOutput),
-    NotFound,
-    Unknown(Box<Error>)
-}
-
-impl Error for TrainzUtilError {
-    fn description(&self) -> &str {
-        match *self {
-            TrainzUtilError::Failure(_) => "TrainzUtil command failed",
-            TrainzUtilError::NotFound => "TrainzUtil not found",
-            TrainzUtilError::Unknown(_) => "unknown error",
-        }
-    }
-
-    fn cause(&self) -> Option<&Error> {
-        match *self {
-            TrainzUtilError::Unknown(ref e) => Some(&**e),
-            _ => None
-        }
-    }
-}
-
-impl fmt::Display for TrainzUtilError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            TrainzUtilError::Failure(ref output) =>
-                write!(f, "TrainzUtil command failed with following output:\n{}", with_prefix(">", output)),
-            TrainzUtilError::NotFound => write!(f, "TrainzUtil executable was not found"),
-            TrainzUtilError::Unknown(ref e) => write!(f, "Unknown error: {}", e)
-        }
-    }
-}
-
-impl From<io::Error> for TrainzUtilError {
-    fn from(e: io::Error) -> Self {
-        match e.kind() {
-            io::ErrorKind::NotFound => TrainzUtilError::NotFound,
-            _ => TrainzUtilError::Unknown(Box::new(e))
-        }
-    }
-}
-
-fn execute_trainzutil(path: &Path, args: &[&str]) -> TrainUtilResult {
-    let result = try!(Command::new(path).args(args).output());
-    let output = TrainzUtilOutput::from_stdout(result.stdout);
-    if result.status.success() {
-        Ok(output)
-    } else {
-        Err(TrainzUtilError::Failure(output))
-    }
-}
-
-
-//
-// Logging
-
-
-#[derive(Copy, Clone, Debug)]
-struct Statistics {
-    pub error_count: u32
-}
-
-impl Statistics {
-    fn new() -> Self { Statistics { error_count: 0 } }
-}
-
-
-struct OutputLogger {
-    verbose: bool,
-    stats: Arc<Mutex<Statistics>>
-}
-
-impl OutputLogger {
-    fn init(verbose: bool) -> Arc<Mutex<Statistics>> {
-        let stats = Arc::new(Mutex::new(Statistics::new()));
-        let logger_stats = stats.clone();
-
-        log::set_logger(move |max_log_level| {
-            max_log_level.set(if verbose { LogLevelFilter::Trace } else { LogLevelFilter::Info });
-
-            Box::new(OutputLogger {
-                verbose: verbose,
-                stats: logger_stats
-            })
-        });
-
-        stats
-    }
-}
-
-impl log::Log for OutputLogger {
-    fn enabled(&self, metadata: &log::LogMetadata) -> bool {
-        metadata.level() <= (if self.verbose { LogLevel::Trace } else { LogLevel::Info })
-    }
-
-    fn log(&self, record: &LogRecord) {
-        if self.enabled(record.metadata()) {
-            if record.level() <= LogLevel::Error {
-                println!("ERROR {}", record.args());
-                    self.stats.lock().unwrap().error_count += 1;
-            } else {
-                println!("{}", record.args());
-            };
         }
     }
 }
