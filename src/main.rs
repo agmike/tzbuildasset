@@ -198,8 +198,6 @@ fn build_asset(asset: Asset, build_path: &Path, trainzutil_path: &Path) {
     };
     trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
 
-    std::thread::sleep_ms(2_000);
-
     trace!("Validating...");
     let output = match execute_trainzutil(trainzutil_path, &["validate", KUID_DUMMY]) {
         Ok(output) => output,
@@ -209,6 +207,8 @@ fn build_asset(asset: Asset, build_path: &Path, trainzutil_path: &Path) {
         }
     };
     trace!("Success! TrainzUtil output:\n{}", with_prefix(">", &output));
+
+    // TODO: handle errors in output
 
     trace!("Deleting...");
     let output = match execute_trainzutil(trainzutil_path, &["delete", KUID_DUMMY]) {
