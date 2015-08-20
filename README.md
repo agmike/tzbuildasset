@@ -1,5 +1,5 @@
 # Trainz Asset Builder.
-
+```
 Usage:
   tzbuildasset build   [options] [INPUT]
   tzbuildasset install [options] [INPUT]
@@ -22,8 +22,10 @@ Commands:
 
 Assets are determined by searching for `config.txt` file which contains string like:
 kuid <(kuid|kuid2):[0-9]+:[0-9]+:[0-9]+>
+```
 
 ## Usage with [atom-build](https://atom.io/packages/atom-build)
+Put following in your `.atom-build.json`:
 ```json
 {
   "cmd": "D:\\TrainzDev\\tzbuildasset\\target\\release\\tzbuildasset.exe",
