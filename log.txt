@@ -1,0 +1,1 @@
+   Compiling tzbuildasset v0.1.0 (file:///D:/TrainzDev/tzbuildasset)
