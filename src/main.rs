@@ -2,11 +2,11 @@ extern crate docopt;
 #[macro_use] extern crate lazy_static;
 extern crate regex;
 extern crate rustc_serialize;
-extern crate tempdir;
 
 use std::env;
 use std::error::{Error};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::iter;
 use std::ffi::{OsString};
 use std::fs::{self, File};
 use std::path::{self, Path, PathBuf};
@@ -15,8 +15,6 @@ use std::process::{self};
 use docopt::{Docopt};
 
 use regex::{Regex};
-
-use tempdir::TempDir;
 
 use displayprefix::{with_prefix};
 
@@ -38,16 +36,12 @@ lazy_static! {
     };
 }
 
-const KUID_DUMMY: &'static str = "kuid:298469:999999";
-const KUID_DUMMY_TAG: &'static str = "kuid  <kuid:298469:999999>";
-
 
 const USAGE: &'static str = r#"
 Trainz Asset Builder.
 
 Usage:
-  tzbuildasset build   [options] [INPUT]
-  tzbuildasset install [options] [INPUT]
+  tzbuildasset [options] [INPUT]
 
 Options:
   -r --recursive       Search for assets in all subfolders recursively
@@ -60,10 +54,7 @@ Options:
   -h --help            Show help
   --version            Show version
 
-Builds all assets within given path with TrainzUtil.
-Commands:
-  build                Builds by installing temporary asset with dummy KUID.
-  install              Installs asset directly.
+Installs and validates all assets within given path with TrainzUtil.
 
 Assets are determined by searching for `config.txt` file which contains string like:
 kuid <(kuid|kuid2):[0-9]+:[0-9]+:[0-9]+>
@@ -80,8 +71,6 @@ struct Args {
     flag_silent: bool,
     flag_temp_dir: Option<String>,
     arg_INPUT: Option<String>,
-    cmd_build: bool,
-    cmd_install: bool,
 
     flag_help: bool,
     flag_version: bool,
@@ -103,7 +92,7 @@ fn main() {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    else if args.cmd_build || args.cmd_install {
+    else {
         let success = build(&BuildArguments {
             build_path: &env::current_dir().unwrap().join(args.arg_INPUT.unwrap_or(String::new())),
             trainzutil_path: Path::new(&args.flag_trainzutil.map(|s| OsString::from(s))
@@ -112,7 +101,6 @@ fn main() {
             temp_path: args.flag_temp_dir.as_ref().map(|s| Path::new(s)),
             show_config_path: args.flag_config,
             show_kuid: args.flag_kuid,
-            install: args.cmd_install,
             recursive: args.flag_recursive
         });
 
@@ -127,7 +115,6 @@ struct BuildArguments<'a> {
     pub temp_path: Option<&'a Path>,
     pub show_config_path: bool,
     pub show_kuid: bool,
-    pub install: bool,
     pub recursive: bool
 }
 
@@ -146,26 +133,35 @@ fn build(args: &BuildArguments) -> bool {
         }
     }
 
-    let mut asset_count = 0i32;
-    let mut failed_count = 0i32;
+    let assets = locate_assets(args.build_path, args.recursive);
+    let mut installed = Vec::with_capacity(assets.len());
+    let mut succeeded_count = 0usize;
 
-    for asset in &locate_assets(args.build_path, args.recursive) {
-        asset_count += 1;
-        if !build_asset(asset, args) {
-            failed_count += 1;
+    for asset in &assets {
+        if install_asset(asset, args) {
+            installed.push(asset);
         }
     }
 
-    log_normal!(Info, "==============================================");
-    log_normal!(Info, "BUILD {} ({} Total, {} Succeeded, {} Failed)",
-            if failed_count == 0 { "SUCCESS" } else { "FAILED " },
-            asset_count,
-            asset_count - failed_count,
-            failed_count);
-    log_normal!(Info, "==============================================");
-    log_silent!(Info, "OK ({} Errors, {} Warnings)", failed_count, 0);
+    for asset in &installed {
+        if validate_asset(asset, args) {
+            succeeded_count += 1;
+        }
+    }
 
-    failed_count == 0
+    let output = format!("BUILD {} ({} Total, {} Succeeded, {} Failed)",
+            if succeeded_count == assets.len() { "SUCCESS" } else { "FAILED " },
+            assets.len(),
+            succeeded_count,
+            assets.len() - succeeded_count);
+    let line: String = iter::repeat('=').take(output.len()).collect();
+
+    log_normal!(Info, "{}", line);
+    log_normal!(Info, "{}", output);
+    log_normal!(Info, "{}", line);
+    log_silent!(Info, "OK ({} Errors, {} Warnings)", assets.len() - succeeded_count, 0);
+
+    assets.len() == succeeded_count
 }
 
 
@@ -231,8 +227,46 @@ fn locate_assets_recursive(path: &Path, recursive: bool, located_assets: &mut Ve
 }
 
 
-#[allow(unused_assignments)]
-fn build_asset(asset: &Asset, args: &BuildArguments) -> bool {
+fn install_asset(asset: &Asset, args: &BuildArguments) -> bool {
+
+    let asset_path: &Path = &asset.path;
+    let asset_kuid: &str = &asset.kuid;
+    let asset_name: &str  = &asset.name;
+
+    log_normal!(Info, "Installing asset '{}'", asset_name);
+
+    let result = ({
+        match trainzutil::execute(args.trainzutil_path,
+                &["installfrompath", asset_path.to_string_lossy().as_ref()]) {
+            Ok(output) => {
+                log_verbose!(Info, "Install susccess:\n{}", with_prefix(">", &output)); Ok(())
+            },
+            Err(e) => {
+                log_normal!(Error, "Install failed: {}", e); Err(())
+            }
+        }
+    }).and_then(|_| {
+        match trainzutil::execute(args.trainzutil_path, &["commit", asset_kuid]) {
+            Ok(output) => {
+                log_verbose!(Info, "Commit success:\n{}", with_prefix(">", &output)); Ok(())
+            },
+            Err(e) => {
+                log_normal!(Error, "Commit failed: {}", e); Err(())
+            }
+        }
+    }).and_then(|_| {
+        log_verbose!(Info, "Install success");
+        Ok(())
+    }).or_else(|_| {
+        log_normal!(Error, "Install failed");
+        Err(())
+    });
+
+    result.is_ok()
+}
+
+
+fn validate_asset(asset: &Asset, args: &BuildArguments) -> bool {
 
     let asset_path: &Path = &asset.path;
     let asset_kuid: &str = &asset.kuid;
@@ -255,61 +289,10 @@ fn build_asset(asset: &Asset, args: &BuildArguments) -> bool {
         (_, _)    => format!("[{}]", asset_relative_path.to_string_lossy().as_ref()),
     };
 
-    log_normal!(Info, "Building asset '{}'", asset_name);
-
-    // Holds temp dir until work is done
-    // Directory is deleted in object's destructor
-    let mut temp_dir = None;
-
-    let install_path = if args.install {
-        &*asset.path
-    } else {
-        if let Some(p) = args.temp_path {
-            let temp_path = Path::new(p);
-            let _ = fs::remove_dir_all(temp_path);
-            fs::create_dir_all(temp_path).ok().expect("unable to access temporary directory");
-            log_verbose!(Info, "Using temporary directory: {}", temp_path.display());
-            temp_path
-        } else {
-            temp_dir = Some(TempDir::new("tzassetbuild").ok()
-                    .expect("unable to create temporary directory"));
-            let temp_path = temp_dir.as_ref().unwrap().path();
-            log_verbose!(Info, "Temporary directory: {}", temp_path.display());
-            temp_path
-        }
-    };
-
-    let install_kuid = if args.install { asset_kuid } else { KUID_DUMMY };
-
-    if !args.install {
-        log_verbose!(Info, "Copying asset files to temp directory...");
-        copy_dir(asset_path, install_path).unwrap();
-
-        log_verbose!(Info, "Replacing kuid...");
-        replace_kuid(install_path).unwrap();
-    }
+    log_normal!(Info, "Validating asset '{}'", asset_name);
 
     let result = ({
-        match trainzutil::execute(args.trainzutil_path,
-                &["installfrompath", install_path.to_string_lossy().as_ref()]) {
-            Ok(output) => {
-                log_verbose!(Info, "Install susccess:\n{}", with_prefix(">", &output)); Ok(())
-            },
-            Err(e) => {
-                log_normal!(Error, "Install failed: {}", e); Err(())
-            }
-        }
-    }).and_then(|_| {
-        match trainzutil::execute(args.trainzutil_path, &["commit", install_kuid]) {
-            Ok(output) => {
-                log_verbose!(Info, "Commit success:\n{}", with_prefix(">", &output)); Ok(())
-            },
-            Err(e) => {
-                log_normal!(Error, "Commit failed: {}", e); Err(())
-            }
-        }
-    }).and_then(|_| {
-        match trainzutil::execute(args.trainzutil_path, &["validate", install_kuid]) {
+        match trainzutil::execute(args.trainzutil_path, &["validate", asset_kuid]) {
             Ok(output) => {
                 log_verbose!(Info, "Validation success:\n{}", with_prefix(">", &output));
                 log_validation_output(&asset_output_name, &output);
@@ -324,67 +307,16 @@ fn build_asset(asset: &Asset, args: &BuildArguments) -> bool {
             }
         }
     }).and_then(|_| {
-        log_normal!(Info, "Build success");
+        log_verbose!(Info, "Validation success");
         Ok(())
     }).or_else(|_| {
-        log_normal!(Error, "Build failed");
+        log_normal!(Error, "Validation failed");
         Err(())
     });
-
-    // if !args.install {
-    //     match trainzutil::execute(args.trainzutil_path, &["delete", KUID_DUMMY]) {
-    //         Ok(output) => {
-    //             log_verbose!(Info, "Delete success:\n{}", with_prefix(">", &output));
-    //         },
-    //         Err(e) => {
-    //             log_normal!(Warn, "Delete failed: {}", e);
-    //         }
-    //     }
-    // }
 
     result.is_ok()
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
-    log_verbose!(Info, "Copying directory '{}' to '{}'", src.display(), dst.display());
-    for entry in try!(fs::read_dir(src)) {
-        let entry = try!(entry);
-        let entry_file_name = &PathBuf::from(entry.file_name());
-        let entry_src_path = &entry.path();
-        let entry_dst_path = &{
-            let mut buf = PathBuf::from(dst);
-            buf.push(entry.file_name());
-            buf
-        };
-
-        if try!(entry.file_type()).is_file() {
-            log_verbose!(Info, "Copying file '{}' to '{}'", entry_file_name.display(), entry_dst_path.display());
-            try!(fs::copy(entry_src_path, entry_dst_path));
-        } else if try!(entry.file_type()).is_dir() {
-            try!(fs::create_dir(entry_dst_path));
-            try!(copy_dir(entry_src_path, entry_dst_path));
-        }
-    }
-    Ok(())
-}
-
-fn replace_kuid(asset_root: &Path) -> io::Result<()> {
-    let mut config_path = PathBuf::from(asset_root);
-    config_path.push("config.txt");
-
-    let mut text = {
-        let mut text = String::new();
-        let mut file = try!(File::open(&config_path));
-        try!(file.read_to_string(&mut text));
-        text
-    };
-
-    text = KUID_MATCHER.replace(&text, KUID_DUMMY_TAG);
-
-    let mut file = try!(File::create(&config_path));
-    try!(file.write_all(text.as_bytes()));
-    Ok(())
-}
 
 fn log_validation_output(asset: &str, output: &trainzutil::Output) {
     for line in &output.lines {
